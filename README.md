@@ -1,5 +1,4 @@
 # AutoABSA
-Embarrasingly Simple Unsupervised Aspect Sentiment Tuple Extraction
+Embarrassingly Simple Unsupervised Aspect Sentiment Tuple Extraction
 
 
-## Use our work
