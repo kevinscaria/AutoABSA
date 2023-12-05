@@ -1,2 +1,5 @@
-# UnsupervisedATSC
-A Simple Unsupervised Approach for Cross Domain Aspect Term Sentiment Classification
+# AutoABSA
+Embarrasingly Simple Unsupervised Aspect Sentiment Tuple Extraction
+
+
+## Use our work
