@@ -1,4 +1,12 @@
 import torch
+import spacy
+import numpy as np
+import pandas as pd
+from nltk import word_tokenize
+from functools import reduce
+from sklearn.metrics.pairwise import rbf_kernel
+from typing import Union, Optional, Dict, List
+from transformers import PreTrainedTokenizerFast, PreTrainedTokenizer, PreTrainedModel, AutoTokenizer, AutoModel
 
 
 class OpinionWordMiner:
@@ -6,94 +14,95 @@ class OpinionWordMiner:
     The class is written for a batch_size 1 scenario
     TODO: Convert to a batch processing scenario 
     """
-    def __init__(self, tokenizer, model, gamma = 0.0005, 
-                 we_layer_list=[-1], score_by='attention'):
-        self.tokenizer = tokenizer
-        self.model = model
-        self.gamma = gamma
-        self.token_level_embeddings = None
-        self.score_by = 'attentions' if score_by == 'attention' else 'hidden_states'
 
+    def __init__(self,
+                 tokenizer: Optional[Union[PreTrainedTokenizer, PreTrainedTokenizerFast]] = None,
+                 model: Optional[PreTrainedModel] = None,
+                 similarity_function: Optional = None,
+                 we_layer_list: Optional[List[int]] = None,
+                 score_by: Optional[Union[str]] = None,
+                 spacy_model: Optional[str] = None,
+                 **sim_function_kwargs
+                 ):
+        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased') or tokenizer
+        self.model = AutoModel.from_pretrained('bert-base-uncased') or model
+        self.similarity_function = rbf_kernel or similarity_function
+        if we_layer_list is None:
+            self.we_layer_list = [-1]
+        self.score_by = 'attentions' if (score_by == 'attention' or score_by is None) else 'hidden_states'
+        self.nlp = spacy.load('en_core_web_sm') or spacy.load(spacy_model)
+        self.sim_function_kwargs = sim_function_kwargs
 
-    def _get_word_embeddings(self, tokenized_text):
+    @staticmethod
+    def _get_word_embeddings(model, layer_idx, score_by, tokenized_text):
         """
         This function extracts the word/token embeddings from the specified hidden layers.
         """
-        tokenized_sentence_output = self.model(**tokenized_text)
-        tokenized_sentence_hidden_states = torch.stack(tokenized_sentence_output[self.score_by], dim=0)
+        tokenized_sentence_output = model(**tokenized_text, output_attentions=True)
+        tokenized_sentence_hidden_states = torch.stack(tokenized_sentence_output[score_by], dim=0)
         tokenized_sentence_hidden_states = torch.squeeze(tokenized_sentence_hidden_states, dim=1)
-        if self.score_by == 'attentions':
+        if score_by == 'attentions':
             # Extract the lower layer attention heads
-            tokenized_sentence_embeddings = tokenized_sentence_hidden_states[2] # (Num Heads, Seq Length, Seq Length)
+            tokenized_sentence_embeddings = tokenized_sentence_hidden_states[2]  # (Num Heads, Seq Length, Seq Length)
         else:
-            tokenized_sentence_embeddings = tokenized_sentence_hidden_states.permute(1,0,2) # (Num Layers, Seq Length, Emb_Size)
+            tokenized_sentence_embeddings = tokenized_sentence_hidden_states.permute(
+                1, 0, 2)  # (Num Layers, Seq Length, Emb_Size)
 
-
-        if self.score_by == 'attentions':
-            # Extract specific specific heads for attention based scoring
-            self.token_level_embeddings = tokenized_sentence_embeddings.mean(dim=0).detach().numpy()
+        if score_by == 'attentions':
+            # Extract specific heads for attention based scoring
+            token_level_embeddings = tokenized_sentence_embeddings.mean(dim=0).detach().numpy()
         else:
             # Extract specific layer outputs for embedding based scoring
             token_vecs_cat = []
             for token in tokenized_sentence_embeddings:
-                cat_vec = torch.cat((
-                    token[0],
-                    token[1],
-                    token[2],
-                    # token[-1]
-                ), dim=0)
+                cat_vec = torch.mean(torch.cat(([i for i in layer_idx]), dim=1), dim=1)
                 token_vecs_cat.append(cat_vec.detach().numpy())
-            self.token_level_embeddings = np.array(token_vecs_cat)
-        return self.token_level_embeddings, tokenized_sentence_output
-    
+            token_level_embeddings = np.array(token_vecs_cat)
+        return token_level_embeddings, tokenized_sentence_output
 
-    def _get_aligned_subwords_embeddings(self, text):
+    @staticmethod
+    def _get_aligned_subwords_embeddings(tokenizer, token_level_embeddings, score_by, text):
         """
         Return word embeddings from hidden states when word piece/byte pair tokenizer is used.
         This method aligns the subwords into words by averaging the embeddings of subwords together
         """
         word_embeddings_aligned_list = []
         index_handler_for_cols = []
-        tokens = self.tokenizer.tokenize(text)
+        tokens = tokenizer.tokenize(text)
         new_tokens = word_tokenize(text)
 
-        print("TOKENS ORIGINAL: ", tokens)
-        print("TOKENS NEW: ", new_tokens)
-        
         for word in new_tokens:
-            tokenized_token = self.tokenizer.tokenize(word)
+            tokenized_token = tokenizer.tokenize(word)
             start_idx = tokens.index(tokenized_token[0])
             end_idx = start_idx + len(tokenized_token)
-            word_embeddings = self.token_level_embeddings[start_idx:end_idx]
-            # if word == 'car':
-            #     print("ll: ", word_embeddings)
+            word_embeddings = token_level_embeddings[start_idx:end_idx]
             if word_embeddings.shape[0] > 1:
-                word_embeddings =np.mean(word_embeddings, axis=0).reshape(1, -1)
+                word_embeddings = np.mean(word_embeddings, axis=0).reshape(1, -1)
                 index_handler_for_cols.append([start_idx, end_idx])
 
             word_embeddings_aligned_list.append(word_embeddings)
 
         word_embeddings_aligned = np.array(word_embeddings_aligned_list).squeeze(axis=1)
 
-        if self.score_by == 'attentions':
+        if score_by == 'attentions':
             diff_idx_ = 0
             for start_idx_, end_idx_ in index_handler_for_cols:
-                start_idx_-=diff_idx_
-                end_idx_-=diff_idx_
+                start_idx_ -= diff_idx_
+                end_idx_ -= diff_idx_
                 mean_val = np.mean(word_embeddings_aligned[:, start_idx_:end_idx_], axis=1, keepdims=True)
                 word_embeddings_aligned[:, [start_idx_]] = mean_val
-                word_embeddings_aligned = np.delete(word_embeddings_aligned, np.s_[start_idx_+1:end_idx_], axis=1)
-                diff_idx_ = end_idx_ - start_idx_-1
+                word_embeddings_aligned = np.delete(word_embeddings_aligned, slice(start_idx_ + 1, end_idx_), axis=1)
+                diff_idx_ = end_idx_ - start_idx_ - 1
 
         assert len(new_tokens) == word_embeddings_aligned.shape[0]
-        
-        if self.score_by == 'attentions':
+
+        if score_by == 'attentions':
             assert len(new_tokens) == word_embeddings_aligned.shape[1]
 
         return torch.tensor(word_embeddings_aligned), new_tokens
-    
 
-    def _filter_candidates(self, dataframe, shift_index_filter, pos_filter):
+    @staticmethod
+    def _filter_candidates(dataframe, shift_index_filter, pos_filter):
         """
         Method to create rules for extracting compound phrases.
         Arguments:
@@ -103,37 +112,44 @@ class OpinionWordMiner:
         """
         filter_ = [(idx_, pos_) for idx_, pos_ in zip(shift_index_filter, pos_filter)]
         filter_condition = reduce(lambda x, y: x & y, [dataframe['pos'].shift(pos_) == val_ for pos_, val_ in filter_])
-        
+
         compound_phrase_idx = []
         comp_phrase_record = []
         for idx in dataframe[filter_condition].index:
             if (idx + 1) < len(dataframe):
                 comp_phrase_record = [
-                    ' '.join([dataframe.loc[idx-idx_val]['opinion_word'] for idx_val in shift_index_filter]),
+                    ' '.join([dataframe.loc[idx - idx_val]['opinion_word'] for idx_val in shift_index_filter]),
                     dataframe.loc[idx]['attention_score'],
-                    '-'.join([dataframe.loc[idx-idx_val]['pos'] for idx_val in shift_index_filter]),
+                    '-'.join([dataframe.loc[idx - idx_val]['pos'] for idx_val in shift_index_filter]),
                     dataframe.loc[idx]['dep']
-                    ]
+                ]
                 for idx_val in shift_index_filter:
-                    compound_phrase_idx.append(idx-idx_val)
+                    compound_phrase_idx.append(idx - idx_val)
                 dataframe.loc[len(dataframe)] = comp_phrase_record
         dataframe.drop(index=compound_phrase_idx, inplace=True)
         return dataframe
 
-    
-    def mine_opinion_words(self, text, aspect_word, display_df = False):
+    def mine_opinion_words(self, text, aspect_word, display_df=False):
         # Tokenize the text
         tokenized_text = self.tokenizer.encode_plus(text, add_special_tokens=False, return_tensors='pt')
 
         # Query the word embeddings/attention_weights for each token
-        word_embeddings, temp_ = self._get_word_embeddings(tokenized_text)
+        word_embeddings, temp_ = self._get_word_embeddings(model=self.model,
+                                                           layer_idx=self.we_layer_list,
+                                                           score_by=self.score_by,
+                                                           tokenized_text=tokenized_text
+                                                           )
 
         # Align the word embeddings if the tokenizer splits words into sub words
-        word_embeddings, aligned_tokens = self._get_aligned_subwords_embeddings(text)
+        word_embeddings, aligned_tokens = self._get_aligned_subwords_embeddings(tokenizer=self.tokenizer,
+                                                                                token_level_embeddings=word_embeddings,
+                                                                                score_by=self.score_by,
+                                                                                text=text
+                                                                                )
 
         # Extract POS tags and Dependency tags
-        spacy_tokens_pos_tags = [token.pos_ for token in nlp(text)]
-        spacy_tokens_deps = [token.dep_ for token in nlp(text)]
+        spacy_tokens_pos_tags = [token.pos_ for token in self.nlp(text)]
+        spacy_tokens_deps = [token.dep_ for token in self.nlp(text)]
 
         try:
             # Set default attention score for the aspect word
@@ -141,9 +157,10 @@ class OpinionWordMiner:
 
             if self.score_by != 'attentions':
                 # Only use RBF kernel similarity if it is embedding based method
-                self_attention_matrix = rbf_kernel(word_embeddings, word_embeddings, self.gamma)
+                self_attention_matrix = self.similarity_function(self.sim_function_kwargs)
             else:
-                # RBF Kernel is not required since attention weights already show where the Query is attending to other Key vectors
+                # RBF Kernel is not required since attention weights already
+                # show where the Query is attending to other Key vectors
                 self_attention_matrix = word_embeddings
 
             if ' ' in aspect_word:
@@ -161,60 +178,55 @@ class OpinionWordMiner:
                 drop_records = [aspect_word_idx]
                 aspect_word_score = self_attention_matrix[:, aspect_word_idx]
 
-            dep_df = pd.DataFrame(aspect_word_score, columns = ['attention_score'], index=aligned_tokens)
+            dep_df = pd.DataFrame(aspect_word_score, columns=['attention_score'], index=aligned_tokens)
             dep_df['pos'] = spacy_tokens_pos_tags
-            dep_df['dep'] = spacy_tokens_deps            
-            dep_df = dep_df.reset_index().rename(columns = {'index':'opinion_word'})
-            dep_df.drop(index=drop_records, inplace=True) # Remove aspect word scores (since it will be highest)
+            dep_df['dep'] = spacy_tokens_deps
+            dep_df = dep_df.reset_index().rename(columns={'index': 'opinion_word'})
+            dep_df.drop(index=drop_records, inplace=True)  # Remove aspect word scores (since it will be highest)
 
             # Reset index before applying rule based filtering
             dep_df.reset_index(drop=True, inplace=True)
-            display(dep_df)
 
             """
             TODO: Add option to generalize the rules 
-            """            
-    
+            """
+
             # RULE 1: COMPOUND PHRASE EXTRACTION -> Compound Noun (Adjective + Noun) [AMOD]
-            dep_df = self._filter_candidates(dataframe=dep_df, 
-                                             shift_index_filter=[0, -1], 
+            dep_df = self._filter_candidates(dataframe=dep_df,
+                                             shift_index_filter=[0, -1],
                                              pos_filter=['ADJ', 'NOUN'])
 
             # RULE 2: COMPOUND PHRASE EXTRACTION -> Compound Noun (Adjective + Noun + Noun) [AMOD~COMPOUND]
-            dep_df = self._filter_candidates(dataframe=dep_df, 
-                                             shift_index_filter=[0, -1, -2], 
+            dep_df = self._filter_candidates(dataframe=dep_df,
+                                             shift_index_filter=[0, -1, -2],
                                              pos_filter=['ADJ', 'NOUN', 'NOUN'])
 
             # RULE 3: COMPOUND PHRASE EXTRACTION -> Adverbial Phrase (Adverb + Adjective)
-            dep_df = self._filter_candidates(dataframe=dep_df, 
-                                             shift_index_filter=[0, -1], 
+            dep_df = self._filter_candidates(dataframe=dep_df,
+                                             shift_index_filter=[0, -1],
                                              pos_filter=['ADV', 'ADJ'])
-        
-            # RULE 4: COMPOUND PHRASE EXTRACTION -> Adverbial Phrase (AdP + NOUN)
-            dep_df = self._filter_candidates(dataframe=dep_df, 
-                                             shift_index_filter=[0, -1], 
-                                             pos_filter=['ADP', 'NOUN'])
 
-            if display_df:
-                display(dep_df)
+            # RULE 4: COMPOUND PHRASE EXTRACTION -> Adverbial Phrase (AdP + NOUN)
+            dep_df = self._filter_candidates(dataframe=dep_df,
+                                             shift_index_filter=[0, -1],
+                                             pos_filter=['ADP', 'NOUN'])
 
             dep_df.reset_index(drop=True, inplace=True)
 
+            print(dep_df)
+
             # Final filters
-            dep_df = dep_df[(dep_df['pos'] == 'ADJ') | \
-                            (dep_df['pos'] == 'ADJ-NOUN') |\
-                            (dep_df['pos'] == 'ADJ-NOUN-NOUN') |\
-                            (dep_df['pos'] == 'ADV-ADJ') |\
+            dep_df = dep_df[(dep_df['pos'] == 'ADJ') |
+                            (dep_df['pos'] == 'ADJ-NOUN') |
+                            (dep_df['pos'] == 'ADJ-NOUN-NOUN') |
+                            (dep_df['pos'] == 'ADV-ADJ') |
                             (dep_df['pos'] == 'ADP-NOUN')
                             ]
-
-            if display_df:
-                display(dep_df)
             if dep_df.shape[0] == 0:
                 return ''
 
-            # Candidate Reweighting
-            opinion_word = dep_df.sort_values(by = 'attention_score', ascending = False).head(1)['opinion_word'].values[0]
+            # Candidate Reweighing
+            opinion_word = dep_df.sort_values(by='attention_score', ascending=False).head(1)['opinion_word'].values[0]
             return opinion_word, None
         except:
-            return 'NoOptinionTerm', None
+            return 'NoOpinionTerm', None
