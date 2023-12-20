@@ -2,8 +2,8 @@
 Unsupervised Aspect Based Sentiment Analysis
 
 This repository is based on two papers:
-1. Aspect Extraction Task - [https://aclanthology.org/2020.acl-main.290/](EmbarrassinglySimpleUnsupervisedAspectExtraction)
-2. Opinion Word Extraction and Sentiment POlarity Detection Task - [https://aclanthology.org/2020.acl-main.290/](Embarrassingly Simple Unsupervised Aspect Sentiment Tuple Extraction)
+1. Aspect Extraction Task - [EmbarrassinglySimpleUnsupervisedAspectExtraction](https://aclanthology.org/2020.acl-main.290/)
+2. Opinion Word Extraction and Sentiment POlarity Detection Task - [Embarrassingly Simple Unsupervised Aspect Sentiment Tuple Extraction](https://aclanthology.org/2020.acl-main.290/)
 
 ## Usage
 The usage is simple
