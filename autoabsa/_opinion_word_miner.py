@@ -1,12 +1,12 @@
 import torch
-import spacy
+import sklearn
 import numpy as np
 import pandas as pd
 from nltk import word_tokenize
 from functools import reduce
-from sklearn.metrics.pairwise import rbf_kernel
-from typing import Union, Optional, Dict, List
-from transformers import PreTrainedTokenizerFast, PreTrainedTokenizer, PreTrainedModel, AutoTokenizer, AutoModel
+from typing import Union, List
+from spacy.language import Language
+from transformers import PreTrainedTokenizerFast, PreTrainedTokenizer, PreTrainedModel
 
 
 class OpinionWordMiner:
@@ -16,22 +16,21 @@ class OpinionWordMiner:
     """
 
     def __init__(self,
-                 tokenizer: Optional[Union[PreTrainedTokenizer, PreTrainedTokenizerFast]] = None,
-                 model: Optional[PreTrainedModel] = None,
-                 similarity_function: Optional = None,
-                 we_layer_list: Optional[List[int]] = None,
-                 score_by: Optional[Union[str]] = None,
-                 spacy_model: Optional[str] = None,
-                 **sim_function_kwargs
+                 tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+                 model: PreTrainedModel,
+                 similarity_function: sklearn.metrics,
+                 we_layer_list: List[int],
+                 score_by: Union[str],
+                 spacy_model: Language,
+                 gamma: float
                  ):
-        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased') or tokenizer
-        self.model = AutoModel.from_pretrained('bert-base-uncased') or model
-        self.similarity_function = rbf_kernel or similarity_function
-        if we_layer_list is None:
-            self.we_layer_list = [-1]
-        self.score_by = 'attentions' if (score_by == 'attention' or score_by is None) else 'hidden_states'
-        self.nlp = spacy.load('en_core_web_sm') or spacy.load(spacy_model)
-        self.sim_function_kwargs = sim_function_kwargs
+        self.tokenizer = tokenizer
+        self.model = model
+        self.similarity_function = similarity_function
+        self.we_layer_list = we_layer_list
+        self.score_by = score_by
+        self.nlp = spacy_model
+        self.gamma = gamma
 
     @staticmethod
     def _get_word_embeddings(model, layer_idx, score_by, tokenized_text):
@@ -156,8 +155,11 @@ class OpinionWordMiner:
             aspect_word_score = [0 for i in range(len(aligned_tokens))]
 
             if self.score_by != 'attentions':
-                # Only use RBF kernel similarity if it is embedding based method
-                self_attention_matrix = self.similarity_function(self.sim_function_kwargs)
+                # Only use similarity method if it is embedding based method
+                try:
+                    self_attention_matrix = self.similarity_function(word_embeddings, word_embeddings, gamma=self.gamma)
+                except:
+                    self_attention_matrix = self.similarity_function(word_embeddings, word_embeddings)
             else:
                 # RBF Kernel is not required since attention weights already
                 # show where the Query is attending to other Key vectors

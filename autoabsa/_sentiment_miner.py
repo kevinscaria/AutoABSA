@@ -8,10 +8,10 @@ DEVICE = get_device()
 
 class SentimentMiner:
     def __init__(self,
-                 pos_term: Optional[str] = "good",
-                 neg_term: Optional[str] = "bad",
-                 neutral_term: Optional[str] = "ok",
-                 model_id: Optional[str] = "sentence-transformers/all-MiniLM-L12-v2"
+                 pos_term: Optional[str] = None,
+                 neg_term: Optional[str] = None,
+                 neutral_term: Optional[str] = None,
+                 model_id: Optional[str] = None
                  ) -> None:
         self.pos_term = pos_term
         self.neg_term = neg_term

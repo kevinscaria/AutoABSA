@@ -5,9 +5,8 @@ class AspectTermMiner:
     Title: Embarrassingly Simple Unsupervised Aspect Extraction
     Authors: Stéphan Tulkens, Andreas van Cranenburgh
     """
-    def __init__(self, embeddings):
-        self.embeddings = embeddings
+    def __init__(self, ):
+        pass
 
     def extract_aspect_term(self, text):
-        k = self.embeddings
         return ""
