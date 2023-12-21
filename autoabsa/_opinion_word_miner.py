@@ -1,8 +1,10 @@
+import re
 import torch
 import sklearn
 import numpy as np
 import pandas as pd
 from nltk import word_tokenize
+from sacremoses import MosesTokenizer
 from functools import reduce
 from typing import Union, List
 from spacy.language import Language
@@ -14,6 +16,7 @@ class OpinionWordMiner:
     The class is written for a batch_size 1 scenario
     TODO: Convert to a batch processing scenario 
     """
+    moses_tokenizer = MosesTokenizer()
 
     def __init__(self,
                  tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
@@ -57,10 +60,30 @@ class OpinionWordMiner:
                 cat_vec = torch.mean(torch.cat(([i for i in layer_idx]), dim=1), dim=1)
                 token_vecs_cat.append(cat_vec.detach().numpy())
             token_level_embeddings = np.array(token_vecs_cat)
-        return token_level_embeddings, tokenized_sentence_output
+        return token_level_embeddings
 
     @staticmethod
-    def _get_aligned_subwords_embeddings(tokenizer, token_level_embeddings, score_by, text):
+    def _merge_subword_tokens(token_list):
+        merged_tokens = []
+        current_token = ""
+
+        for token in token_list:
+            if token.startswith("##"):
+                current_token += token[2:]
+            else:
+                if current_token:
+                    merged_tokens.append(current_token)
+                    current_token = ""
+                merged_tokens.append(token)
+
+        # Check if there's a remaining token
+        if current_token:
+            merged_tokens.append(current_token)
+
+        return merged_tokens
+
+    @staticmethod
+    def _get_aligned_subwords_embeddings(tokenizer, token_level_embeddings, score_by, text, debug=False):
         """
         Return word embeddings from hidden states when word piece/byte pair tokenizer is used.
         This method aligns the subwords into words by averaging the embeddings of subwords together
@@ -68,7 +91,15 @@ class OpinionWordMiner:
         word_embeddings_aligned_list = []
         index_handler_for_cols = []
         tokens = tokenizer.tokenize(text)
-        new_tokens = word_tokenize(text)
+        # manual_tokens = OpinionWordMiner._merge_subword_tokens(tokens)
+        # nltk_tokens = word_tokenize(text)
+        # moses_tokens = [i.lower() for i in OpinionWordMiner.moses_tokenizer.tokenize(text, escape=False)]
+        regex_tokens = [i.lower() for i in re.findall(r'\w+|\S', text)]
+
+        new_tokens = regex_tokens
+
+        if debug:
+            print("SHAPE: ", token_level_embeddings.shape)
 
         for word in new_tokens:
             tokenized_token = tokenizer.tokenize(word)
@@ -76,6 +107,8 @@ class OpinionWordMiner:
             end_idx = start_idx + len(tokenized_token)
             word_embeddings = token_level_embeddings[start_idx:end_idx]
             if word_embeddings.shape[0] > 1:
+                if debug:
+                    print("WORDS: ", word)
                 word_embeddings = np.mean(word_embeddings, axis=0).reshape(1, -1)
                 index_handler_for_cols.append([start_idx, end_idx])
 
@@ -84,14 +117,24 @@ class OpinionWordMiner:
         word_embeddings_aligned = np.array(word_embeddings_aligned_list).squeeze(axis=1)
 
         if score_by == 'attentions':
+            # Aligning Key Vectors
             diff_idx_ = 0
             for start_idx_, end_idx_ in index_handler_for_cols:
+                if debug:
+                    print("BEFORE: ", tokens[start_idx_:end_idx_], start_idx_, end_idx_, word_embeddings_aligned.shape)
                 start_idx_ -= diff_idx_
                 end_idx_ -= diff_idx_
                 mean_val = np.mean(word_embeddings_aligned[:, start_idx_:end_idx_], axis=1, keepdims=True)
                 word_embeddings_aligned[:, [start_idx_]] = mean_val
                 word_embeddings_aligned = np.delete(word_embeddings_aligned, slice(start_idx_ + 1, end_idx_), axis=1)
-                diff_idx_ = end_idx_ - start_idx_ - 1
+                if debug:
+                    print("AFTER: ", tokens[start_idx_:end_idx_], start_idx_, end_idx_, word_embeddings_aligned.shape)
+                diff_idx_ += end_idx_ - start_idx_ - 1
+                if debug:
+                    print('DIFF: ', diff_idx_)
+
+        if debug:
+            print("NEW ALIGN SHAPE:", word_embeddings_aligned.shape)
 
         assert len(new_tokens) == word_embeddings_aligned.shape[0]
 
@@ -128,22 +171,23 @@ class OpinionWordMiner:
         dataframe.drop(index=compound_phrase_idx, inplace=True)
         return dataframe
 
-    def mine_opinion_words(self, text, aspect_word, display_df=False):
+    def mine_opinion_words(self, text, aspect_word, debug=False):
         # Tokenize the text
         tokenized_text = self.tokenizer.encode_plus(text, add_special_tokens=False, return_tensors='pt')
 
         # Query the word embeddings/attention_weights for each token
-        word_embeddings, temp_ = self._get_word_embeddings(model=self.model,
-                                                           layer_idx=self.we_layer_list,
-                                                           score_by=self.score_by,
-                                                           tokenized_text=tokenized_text
-                                                           )
+        word_embeddings = self._get_word_embeddings(model=self.model,
+                                                    layer_idx=self.we_layer_list,
+                                                    score_by=self.score_by,
+                                                    tokenized_text=tokenized_text
+                                                    )
 
         # Align the word embeddings if the tokenizer splits words into sub words
         word_embeddings, aligned_tokens = self._get_aligned_subwords_embeddings(tokenizer=self.tokenizer,
                                                                                 token_level_embeddings=word_embeddings,
                                                                                 score_by=self.score_by,
-                                                                                text=text
+                                                                                text=text,
+                                                                                debug=debug
                                                                                 )
 
         # Extract POS tags and Dependency tags
@@ -208,24 +252,36 @@ class OpinionWordMiner:
                                              shift_index_filter=[0, -1],
                                              pos_filter=['ADV', 'ADJ'])
 
-            # RULE 4: COMPOUND PHRASE EXTRACTION -> Adverbial Phrase (AdP + NOUN)
+            # RULE 4: COMPOUND PHRASE EXTRACTION -> Adverbial Phrase (ADP + NOUN)
             dep_df = self._filter_candidates(dataframe=dep_df,
                                              shift_index_filter=[0, -1],
                                              pos_filter=['ADP', 'NOUN'])
 
+            dep_df = self._filter_candidates(dataframe=dep_df,
+                                             shift_index_filter=[0, -1, -2],
+                                             pos_filter=['VERB', 'VERB', 'ADV'])
+
+            dep_df = self._filter_candidates(dataframe=dep_df,
+                                             shift_index_filter=[0, -1],
+                                             pos_filter=['VERB', 'ADV'])
+
             dep_df.reset_index(drop=True, inplace=True)
 
-            print(dep_df)
+            if debug:
+                print(dep_df)
 
             # Final filters
             dep_df = dep_df[(dep_df['pos'] == 'ADJ') |
                             (dep_df['pos'] == 'ADJ-NOUN') |
                             (dep_df['pos'] == 'ADJ-NOUN-NOUN') |
                             (dep_df['pos'] == 'ADV-ADJ') |
-                            (dep_df['pos'] == 'ADP-NOUN')
+                            (dep_df['pos'] == 'ADP-NOUN') |
+                            (dep_df['pos'] == 'VERB-VERB-ADV') |
+                            (dep_df['pos'] == 'VERB-ADV')
                             ]
+
             if dep_df.shape[0] == 0:
-                return ''
+                return 'NoRuleParsed', None
 
             # Candidate Reweighing
             opinion_word = dep_df.sort_values(by='attention_score', ascending=False).head(1)['opinion_word'].values[0]
