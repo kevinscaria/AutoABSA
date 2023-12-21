@@ -7,6 +7,7 @@ from nltk import word_tokenize
 from sacremoses import MosesTokenizer
 from functools import reduce
 from typing import Union, List
+from spacy.tokens import Doc
 from spacy.language import Language
 from transformers import PreTrainedTokenizerFast, PreTrainedTokenizer, PreTrainedModel
 
@@ -33,7 +34,13 @@ class OpinionWordMiner:
         self.we_layer_list = we_layer_list
         self.score_by = score_by
         self.nlp = spacy_model
+        self.nlp.tokenizer = self.custom_tokenizer
         self.gamma = gamma
+
+    def custom_tokenizer(self, text):
+        # Implement custom regex tokenization logic
+        tokens = [i.lower() for i in re.findall(r'\w+|\S', text)]
+        return Doc(self.nlp.vocab, words=tokens)
 
     @staticmethod
     def _get_word_embeddings(model, layer_idx, score_by, tokenized_text):
@@ -99,11 +106,17 @@ class OpinionWordMiner:
         new_tokens = regex_tokens
 
         if debug:
+            print("TOKENS: ", new_tokens)
+            print("HF TOKENS: ", tokens)
             print("SHAPE: ", token_level_embeddings.shape)
 
         for word in new_tokens:
             tokenized_token = tokenizer.tokenize(word)
-            start_idx = tokens.index(tokenized_token[0])
+            if len(tokenized_token) > 1:
+                second_idx = tokens.index(tokenized_token[1])
+                start_idx = second_idx-1
+            else:
+                start_idx = tokens.index(tokenized_token[0])
             end_idx = start_idx + len(tokenized_token)
             word_embeddings = token_level_embeddings[start_idx:end_idx]
             if word_embeddings.shape[0] > 1:
@@ -128,7 +141,7 @@ class OpinionWordMiner:
                 word_embeddings_aligned[:, [start_idx_]] = mean_val
                 word_embeddings_aligned = np.delete(word_embeddings_aligned, slice(start_idx_ + 1, end_idx_), axis=1)
                 if debug:
-                    print("AFTER: ", tokens[start_idx_:end_idx_], start_idx_, end_idx_, word_embeddings_aligned.shape)
+                    print("AFTER: ", start_idx_, end_idx_, word_embeddings_aligned.shape)
                 diff_idx_ += end_idx_ - start_idx_ - 1
                 if debug:
                     print('DIFF: ', diff_idx_)
@@ -190,6 +203,9 @@ class OpinionWordMiner:
                                                                                 debug=debug
                                                                                 )
 
+        if debug:
+            print("TEXT: ", text)
+
         # Extract POS tags and Dependency tags
         spacy_tokens_pos_tags = [token.pos_ for token in self.nlp(text)]
         spacy_tokens_deps = [token.dep_ for token in self.nlp(text)]
@@ -229,6 +245,9 @@ class OpinionWordMiner:
             dep_df['dep'] = spacy_tokens_deps
             dep_df = dep_df.reset_index().rename(columns={'index': 'opinion_word'})
             dep_df.drop(index=drop_records, inplace=True)  # Remove aspect word scores (since it will be highest)
+
+            if debug:
+                print(dep_df)
 
             # Reset index before applying rule based filtering
             dep_df.reset_index(drop=True, inplace=True)
