@@ -3,13 +3,17 @@ import torch
 import sklearn
 import numpy as np
 import pandas as pd
-from nltk import word_tokenize
-from sacremoses import MosesTokenizer
+# from nltk import word_tokenize
+# from sacremoses import MosesTokenizer
 from functools import reduce
+from collections import defaultdict
 from typing import Union, List
 from spacy.tokens import Doc
 from spacy.language import Language
 from transformers import PreTrainedTokenizerFast, PreTrainedTokenizer, PreTrainedModel
+from .utils import get_device
+
+DEVICE = get_device()
 
 
 class OpinionWordMiner:
@@ -17,7 +21,8 @@ class OpinionWordMiner:
     The class is written for a batch_size 1 scenario
     TODO: Convert to a batch processing scenario 
     """
-    moses_tokenizer = MosesTokenizer()
+
+    # moses_tokenizer = MosesTokenizer()
 
     def __init__(self,
                  tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
@@ -47,6 +52,10 @@ class OpinionWordMiner:
         """
         This function extracts the word/token embeddings from the specified hidden layers.
         """
+
+        model = model.to(DEVICE)
+        tokenized_text = tokenized_text.to(DEVICE)
+
         tokenized_sentence_output = model(**tokenized_text, output_attentions=True)
         tokenized_sentence_hidden_states = torch.stack(tokenized_sentence_output[score_by], dim=0)
         tokenized_sentence_hidden_states = torch.squeeze(tokenized_sentence_hidden_states, dim=1)
@@ -59,12 +68,12 @@ class OpinionWordMiner:
 
         if score_by == 'attentions':
             # Extract specific heads for attention based scoring
-            token_level_embeddings = tokenized_sentence_embeddings.mean(dim=0).detach().numpy()
+            token_level_embeddings = tokenized_sentence_embeddings.mean(dim=0).detach().cpu().numpy()
         else:
             # Extract specific layer outputs for embedding based scoring
             token_vecs_cat = []
             for token in tokenized_sentence_embeddings:
-                cat_vec = torch.mean(torch.cat(([i for i in layer_idx]), dim=1), dim=1)
+                cat_vec = torch.mean(torch.cat(([token[i] for i in layer_idx]), dim=1), dim=1)
                 token_vecs_cat.append(cat_vec.detach().numpy())
             token_level_embeddings = np.array(token_vecs_cat)
         return token_level_embeddings
@@ -110,13 +119,23 @@ class OpinionWordMiner:
             print("HF TOKENS: ", tokens)
             print("SHAPE: ", token_level_embeddings.shape)
 
+        visited = defaultdict(int)
         for word in new_tokens:
             tokenized_token = tokenizer.tokenize(word)
             if len(tokenized_token) > 1:
-                second_idx = tokens.index(tokenized_token[1])
-                start_idx = second_idx-1
+                if tokenized_token[1] in visited:
+                    second_idxs = [index for index, char in enumerate(tokens) if char == tokenized_token[1]]
+                    second_idx = second_idxs[visited[tokenized_token[1]]]
+                else:
+                    second_idx = tokens.index(tokenized_token[1])
+                start_idx = second_idx - 1
+                visited[tokenized_token[1]] += 1
             else:
-                start_idx = tokens.index(tokenized_token[0])
+                if tokenized_token[0] in visited:
+                    start_idxs = [index for index, char in enumerate(tokens) if char == tokenized_token[0]]
+                    start_idx = start_idxs[visited[tokenized_token[0]]]
+                else:
+                    start_idx = tokens.index(tokenized_token[0])
             end_idx = start_idx + len(tokenized_token)
             word_embeddings = token_level_embeddings[start_idx:end_idx]
             if word_embeddings.shape[0] > 1:
@@ -169,7 +188,6 @@ class OpinionWordMiner:
         filter_condition = reduce(lambda x, y: x & y, [dataframe['pos'].shift(pos_) == val_ for pos_, val_ in filter_])
 
         compound_phrase_idx = []
-        comp_phrase_record = []
         for idx in dataframe[filter_condition].index:
             if (idx + 1) < len(dataframe):
                 comp_phrase_record = [
@@ -182,14 +200,15 @@ class OpinionWordMiner:
                     compound_phrase_idx.append(idx - idx_val)
                 dataframe.loc[len(dataframe)] = comp_phrase_record
         dataframe.drop(index=compound_phrase_idx, inplace=True)
+        dataframe.reset_index(drop=True, inplace=True)
         return dataframe
 
-    def mine_opinion_words(self, text, aspect_word, debug=False):
+    def mine_opinion_words(self, text, aspect_word, debug=False, model=None):
         # Tokenize the text
         tokenized_text = self.tokenizer.encode_plus(text, add_special_tokens=False, return_tensors='pt')
 
         # Query the word embeddings/attention_weights for each token
-        word_embeddings = self._get_word_embeddings(model=self.model,
+        word_embeddings = self._get_word_embeddings(model=self.model if model is None else model,
                                                     layer_idx=self.we_layer_list,
                                                     score_by=self.score_by,
                                                     tokenized_text=tokenized_text
@@ -205,105 +224,121 @@ class OpinionWordMiner:
 
         if debug:
             print("TEXT: ", text)
+            print("ASPECT: ", aspect_word)
 
         # Extract POS tags and Dependency tags
         spacy_tokens_pos_tags = [token.pos_ for token in self.nlp(text)]
         spacy_tokens_deps = [token.dep_ for token in self.nlp(text)]
 
-        try:
-            # Set default attention score for the aspect word
-            aspect_word_score = [0 for i in range(len(aligned_tokens))]
+        # try:
+        # Set default attention score for the aspect word
+        aspect_word_score = [0 for i in range(len(aligned_tokens))]
 
-            if self.score_by != 'attentions':
-                # Only use similarity method if it is embedding based method
-                try:
-                    self_attention_matrix = self.similarity_function(word_embeddings, word_embeddings, gamma=self.gamma)
-                except:
-                    self_attention_matrix = self.similarity_function(word_embeddings, word_embeddings)
-            else:
-                # RBF Kernel is not required since attention weights already
-                # show where the Query is attending to other Key vectors
-                self_attention_matrix = word_embeddings
+        if self.score_by != 'attentions':
+            # Only use similarity method if it is embedding based method
+            try:
+                self_attention_matrix = self.similarity_function(word_embeddings, word_embeddings, gamma=self.gamma)
+            except:
+                self_attention_matrix = self.similarity_function(word_embeddings, word_embeddings)
+        else:
+            # RBF Kernel is not required since attention weights already
+            # show where the Query is attending to other Key vectors
+            self_attention_matrix = word_embeddings
 
-            if ' ' in aspect_word:
-                drop_records = []
-                aspect_words = aspect_word.split()
-                combined_aspect_word_embeddings = []
+        if debug:
+            print("AT: ", aligned_tokens)
+        aspect_word = aspect_word.lower()
 
-                for aspect_word in aspect_words:
-                    aspect_word_idx = aligned_tokens.index(aspect_word)
-                    drop_records.append(aspect_word_idx)
-                    combined_aspect_word_embeddings.append(self_attention_matrix[aspect_word_idx])
-                aspect_word_score = np.mean(combined_aspect_word_embeddings, axis=0)
-            else:
+        # if ' ' in aspect_word or '-' in aspect_word:
+        #     drop_records = []
+        #     aspect_words = aspect_word.split()
+        aspect_words = re.findall(r'\w+', aspect_word)
+
+        if len(aspect_word) > 1:
+            drop_records = []
+            combined_aspect_word_embeddings = []
+            for aspect_word in aspect_words:
                 aspect_word_idx = aligned_tokens.index(aspect_word)
-                drop_records = [aspect_word_idx]
-                aspect_word_score = self_attention_matrix[:, aspect_word_idx]
+                drop_records.append(aspect_word_idx)
+                combined_aspect_word_embeddings.append(self_attention_matrix[aspect_word_idx])
+            aspect_word_score = np.mean(combined_aspect_word_embeddings, axis=0)
+        else:
+            aspect_word = aspect_words[0]
+            aspect_word_idx = aligned_tokens.index(aspect_word)
+            drop_records = [aspect_word_idx]
+            aspect_word_score = self_attention_matrix[:, aspect_word_idx]
 
-            dep_df = pd.DataFrame(aspect_word_score, columns=['attention_score'], index=aligned_tokens)
-            dep_df['pos'] = spacy_tokens_pos_tags
-            dep_df['dep'] = spacy_tokens_deps
-            dep_df = dep_df.reset_index().rename(columns={'index': 'opinion_word'})
-            dep_df.drop(index=drop_records, inplace=True)  # Remove aspect word scores (since it will be highest)
+        dep_df = pd.DataFrame(aspect_word_score, columns=['attention_score'], index=aligned_tokens)
+        dep_df['pos'] = spacy_tokens_pos_tags
+        dep_df['dep'] = spacy_tokens_deps
+        dep_df = dep_df.reset_index().rename(columns={'index': 'opinion_word'})
+        dep_df.drop(index=drop_records, inplace=True)  # Remove aspect word scores (since it will be highest)
 
-            if debug:
-                print(dep_df)
+        # if debug:
+        #     print(dep_df)
 
-            # Reset index before applying rule based filtering
-            dep_df.reset_index(drop=True, inplace=True)
+        # Reset index before applying rule based filtering
+        dep_df.reset_index(drop=True, inplace=True)
 
-            """
-            TODO: Add option to generalize the rules 
-            """
+        """
+        TODO: Add option to generalize the rules 
+        """
 
-            # RULE 1: COMPOUND PHRASE EXTRACTION -> Compound Noun (Adjective + Noun) [AMOD]
-            dep_df = self._filter_candidates(dataframe=dep_df,
-                                             shift_index_filter=[0, -1],
-                                             pos_filter=['ADJ', 'NOUN'])
+        # RULE 1: COMPOUND PHRASE EXTRACTION -> Compound Noun (Adjective + Noun) [AMOD]
+        dep_df = self._filter_candidates(dataframe=dep_df,
+                                         shift_index_filter=[0, -1],
+                                         pos_filter=['ADJ', 'NOUN'])
 
-            # RULE 2: COMPOUND PHRASE EXTRACTION -> Compound Noun (Adjective + Noun + Noun) [AMOD~COMPOUND]
-            dep_df = self._filter_candidates(dataframe=dep_df,
-                                             shift_index_filter=[0, -1, -2],
-                                             pos_filter=['ADJ', 'NOUN', 'NOUN'])
+        # RULE 2: COMPOUND PHRASE EXTRACTION -> Compound Noun (Adjective + Noun + Noun) [AMOD~COMPOUND]
+        dep_df = self._filter_candidates(dataframe=dep_df,
+                                         shift_index_filter=[0, -1, -2],
+                                         pos_filter=['ADJ', 'NOUN', 'NOUN'])
 
-            # RULE 3: COMPOUND PHRASE EXTRACTION -> Adverbial Phrase (Adverb + Adjective)
-            dep_df = self._filter_candidates(dataframe=dep_df,
-                                             shift_index_filter=[0, -1],
-                                             pos_filter=['ADV', 'ADJ'])
+        # RULE 3: COMPOUND PHRASE EXTRACTION -> Adverbial Phrase (Adverb + Adjective)
+        dep_df = self._filter_candidates(dataframe=dep_df,
+                                         shift_index_filter=[0, -1],
+                                         pos_filter=['ADV', 'ADJ'])
 
-            # RULE 4: COMPOUND PHRASE EXTRACTION -> Adverbial Phrase (ADP + NOUN)
-            dep_df = self._filter_candidates(dataframe=dep_df,
-                                             shift_index_filter=[0, -1],
-                                             pos_filter=['ADP', 'NOUN'])
+        if debug:
+            print('KKKKK')
+            print(dep_df)
 
-            dep_df = self._filter_candidates(dataframe=dep_df,
-                                             shift_index_filter=[0, -1, -2],
-                                             pos_filter=['VERB', 'VERB', 'ADV'])
+        # RULE 4: COMPOUND PHRASE EXTRACTION -> Adverbial Phrase (ADP + NOUN)
+        dep_df = self._filter_candidates(dataframe=dep_df,
+                                         shift_index_filter=[0, -1],
+                                         pos_filter=['ADP', 'NOUN'])
 
-            dep_df = self._filter_candidates(dataframe=dep_df,
-                                             shift_index_filter=[0, -1],
-                                             pos_filter=['VERB', 'ADV'])
+        dep_df = self._filter_candidates(dataframe=dep_df,
+                                         shift_index_filter=[0, -1, -2],
+                                         pos_filter=['VERB', 'VERB', 'ADV'])
 
-            dep_df.reset_index(drop=True, inplace=True)
+        dep_df = self._filter_candidates(dataframe=dep_df,
+                                         shift_index_filter=[0, -1],
+                                         pos_filter=['VERB', 'ADV'])
 
-            if debug:
-                print(dep_df)
+        dep_df.reset_index(drop=True, inplace=True)
 
-            # Final filters
-            dep_df = dep_df[(dep_df['pos'] == 'ADJ') |
-                            (dep_df['pos'] == 'ADJ-NOUN') |
-                            (dep_df['pos'] == 'ADJ-NOUN-NOUN') |
-                            (dep_df['pos'] == 'ADV-ADJ') |
-                            (dep_df['pos'] == 'ADP-NOUN') |
-                            (dep_df['pos'] == 'VERB-VERB-ADV') |
-                            (dep_df['pos'] == 'VERB-ADV')
-                            ]
+        if debug:
+            print(dep_df)
 
-            if dep_df.shape[0] == 0:
-                return 'NoRuleParsed', None
+        # Final filters
+        dep_df = dep_df[(dep_df['pos'] == 'ADJ') |
+                        (dep_df['pos'] == 'ADJ-NOUN') |
+                        (dep_df['pos'] == 'ADJ-NOUN-NOUN') |
+                        (dep_df['pos'] == 'ADV-ADJ') |
+                        (dep_df['pos'] == 'ADP-NOUN') |
+                        (dep_df['pos'] == 'VERB-VERB-ADV') |
+                        (dep_df['pos'] == 'VERB-ADV')
+                        ]
 
-            # Candidate Reweighing
-            opinion_word = dep_df.sort_values(by='attention_score', ascending=False).head(1)['opinion_word'].values[0]
-            return opinion_word, None
-        except:
-            return 'NoOpinionTerm', None
+        if dep_df.shape[0] == 0:
+            return 'NoRuleParsed', None
+
+        # Candidate Reweighing
+        opinion_word = dep_df.sort_values(by='attention_score', ascending=False).head(1)['opinion_word'].values[0]
+        if debug:
+            print(opinion_word)
+
+        return opinion_word, None
+        # except:
+        #     return 'NoOpinionTerm', None
