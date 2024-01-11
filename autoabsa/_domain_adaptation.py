@@ -17,15 +17,13 @@ class DomainAdaptation:
                  model: PreTrainedModel,
                  text_column: str,
                  chunk_size: int,
-                 mlm_proba: float,
-                 return_trainer: bool
+                 mlm_proba: float
                  ):
         self.chunk_size = chunk_size
         self.text_column = text_column
         self.model = model
         self.tokenizer = tokenizer
         self.mlm_proba = mlm_proba
-        self.return_trainer = return_trainer
 
     def _tokenize_function(self, examples):
         result = self.tokenizer(examples[self.text_column])
@@ -71,6 +69,8 @@ class DomainAdaptation:
         lm_datasets = tokenized_datasets.map(self._group_texts, batched=True)
         data_collator = DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm_probability=self.mlm_proba)
 
+        kwargs['load_best_model_at_end'] = True
+        kwargs['save_total_limit'] = 2
         training_args = TrainingArguments(**kwargs)
 
         trainer = Trainer(
@@ -88,5 +88,4 @@ class DomainAdaptation:
         eval_results = trainer.evaluate()
         print(f">>> Final Perplexity: {math.exp(eval_results['eval_loss']):.2f}")
 
-        if self.return_trainer:
-            return trainer
+        return trainer
